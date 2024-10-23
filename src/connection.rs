@@ -192,7 +192,7 @@ impl Connection {
     {
         let result = {
             let mut conn = self.conn.lock().unwrap();
-            f(&mut *conn)
+            f(&mut conn)
         };
         result.inspect_err(|err| {
             if let Some(incident) = err.to_incident() {

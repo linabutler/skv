@@ -155,13 +155,13 @@ impl<'a> Database<'a> {
         // transactions to commit, instead of returning an about-to-be-stale
         // result.
         let writer = self.store.writer()?;
-        Ok(writer.read(|conn| -> Result<_, DatabaseError> {
+        writer.read(|conn| -> Result<_, DatabaseError> {
             let mut statement = conn.prepare_cached(
                 "SELECT 1 FROM data WHERE db_id = (SELECT id FROM dbs WHERE name = :name)",
             )?;
             let exists = statement.exists(rusqlite::named_params! { ":name": self.name })?;
             Ok(!exists)
-        })?)
+        })
     }
 
     pub fn count(&self) -> Result<i64, DatabaseError> {

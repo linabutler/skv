@@ -40,8 +40,8 @@ enum FunctionError {
     Throw(String),
 }
 
-impl Into<rusqlite::Error> for FunctionError {
-    fn into(self) -> rusqlite::Error {
-        rusqlite::Error::UserFunctionError(self.into())
+impl From<FunctionError> for rusqlite::Error {
+    fn from(val: FunctionError) -> Self {
+        rusqlite::Error::UserFunctionError(val.into())
     }
 }
