@@ -12,3 +12,6 @@ rusqlite = { version = "0.31.0", features = ["functions", "bundled"] }
 serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
