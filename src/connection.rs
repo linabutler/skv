@@ -84,7 +84,7 @@ impl Default for CheckedMmapSize {
 
 impl CheckedMmapSize {
     fn advance_for_connection(&self, conn: &rusqlite::Connection) -> Option<CheckedMmapSize> {
-        let file = SqliteDatabaseFile::for_connection(conn);
+        let file = SqliteDatabaseFile::new(conn);
         let file_size = file.size()?;
         let (mut offset, end) = {
             let offset = match self {

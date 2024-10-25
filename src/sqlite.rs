@@ -3,8 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::{
-    os::raw::c_void,
-    ptr::{self, NonNull},
+    ffi::{CStr, CString}, os::raw::c_void, ptr::{self, NonNull}
 };
 
 /// Wraps a [`rusqlite::Connection`] with operations that
@@ -14,15 +13,22 @@ use std::{
 /// (yet?), so we muck about with the raw, unsafe connection handle.
 pub struct SqliteDatabaseFile<'a> {
     conn: &'a rusqlite::Connection,
+    name: Option<CString>,
 }
 
 impl<'a> SqliteDatabaseFile<'a> {
-    pub fn for_connection(conn: &'a rusqlite::Connection) -> Self {
-        Self { conn }
+    pub fn new(conn: &'a rusqlite::Connection) -> Self {
+        Self { conn, name: None }
     }
 
+    pub fn with_database_name(conn: &'a rusqlite::Connection, name: &str) -> Self {
+        Self { conn, name: CString::new(name).ok() }
+    }
+
+    /// Returns the size of the database file in bytes, or
+    /// `None` if the database is in-memory.
     pub fn size(&self) -> Option<u64> {
-        let file = unsafe { get_sqlite3_file(self.conn.handle()) }?;
+        let file = unsafe { get_sqlite3_file(self.conn.handle(), self.name.as_deref()) }?;
         let methods = NonNull::<rusqlite::ffi::sqlite3_io_methods>::new(
             unsafe { *file.as_ptr() }.pMethods as *mut _,
         )?;
@@ -35,8 +41,10 @@ impl<'a> SqliteDatabaseFile<'a> {
         }
     }
 
+    /// Reads exactly `buf.len()` bytes from the database file,
+    /// starting at the given offset.
     pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), rusqlite::Error> {
-        let Some(file) = (unsafe { get_sqlite3_file(self.conn.handle()) }) else {
+        let Some(file) = (unsafe { get_sqlite3_file(self.conn.handle(), self.name.as_deref()) }) else {
             return Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
                 None,
@@ -79,11 +87,12 @@ impl<'a> SqliteDatabaseFile<'a> {
 
 unsafe fn get_sqlite3_file(
     handle: *mut rusqlite::ffi::sqlite3,
+    db: Option<&CStr>,
 ) -> Option<NonNull<rusqlite::ffi::sqlite3_file>> {
     let mut file = std::ptr::null_mut::<rusqlite::ffi::sqlite3_file>();
     let rc = rusqlite::ffi::sqlite3_file_control(
         handle,
-        ptr::null(), // Defaults to the `main` database.
+        db.map(|db| db.as_ptr()).unwrap_or_else(ptr::null),
         rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
         &mut file as *mut *mut rusqlite::ffi::sqlite3_file as *mut c_void,
     );
