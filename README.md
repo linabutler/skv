@@ -12,13 +12,15 @@ Provide a [CRUD](https://en.wikipedia.org/wiki/Create,_read,_update_and_delete) 
 
 Use [SQLite](https://www.sqlite.org), with best practices that we've learned from using it in Firefox and [Application Services](https://mozilla.github.io/application-services/book/index.html).
 
-Hide database connection management, maintenance, and schema migrations, from front-end and platform consumers.
+Hide database connection management, maintenance, and underlying schema migrations from front-end and platform consumers.
 
 Back up database contents periodically, and detect and recover from on-disk database file corruption.
 
+Allow multiple processes to access a database. This would be useful for sharing state between the Firefox main process and [non-content child processes](https://firefox-source-docs.mozilla.org/ipc/processes.html).
+
 ### Maybe Goals
 
-Shipping Skv as a standalone Rust crate. This would be interesting to explore for our [out-of-tree](https://mozilla.github.io/application-services/book/index.html) [consumers](https://mozilla.github.io/glean/book/index.html).
+Shipping Skv as a standalone Rust crate. This would be interesting to explore for our [out-of-tree](https://mozilla.github.io/application-services/book/index.html) [consumers](https://mozilla.github.io/glean/book/index.html), and could also be useful for sharing state directly between the [front-end](https://searchfox.org/mozilla-central/source/mobile/android/fenix), [Android Components](https://mozac.org/contributing/architecture), and [GeckoView](https://firefox-source-docs.mozilla.org/mobile/android/geckoview/contributor/geckoview-architecture.html) in Firefox for Android.
 
 [Syncing key-value databases](https://bugzilla.mozilla.org/show_bug.cgi?id=1923772). This could help us burn down our ["sync more things" list](https://bugzilla.mozilla.org/show_bug.cgi?id=syncmore).
 
