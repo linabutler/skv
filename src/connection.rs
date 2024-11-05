@@ -9,7 +9,15 @@
 
 use std::{borrow::Cow, fmt::Debug, num::NonZeroU32, path::Path, sync::Mutex};
 
-use rusqlite::{config::DbConfig, InterruptHandle, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{
+    config::DbConfig,
+    types::{FromSql, ToSqlOutput},
+    InterruptHandle, OpenFlags, ToSql, Transaction, TransactionBehavior,
+};
+
+use crate::{dao::Dao, sqlite::SqliteDatabaseFile};
+
+pub const MMAP_SIZE_META_KEY: &str = "mmap_sz";
 
 /// A path to a physical SQLite database, and optional [`OpenFlags`] for
 /// interpreting that path.
@@ -62,6 +70,129 @@ pub struct Connection {
     incidents: Mutex<Vec<ConnectionIncident>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedMmapSize {
+    ValidUpTo(u64),
+    Invalid,
+}
+
+impl Default for CheckedMmapSize {
+    fn default() -> Self {
+        Self::ValidUpTo(0)
+    }
+}
+
+impl CheckedMmapSize {
+    fn advance(&self, conn: &rusqlite::Connection) -> Option<CheckedMmapSize> {
+        let file = SqliteDatabaseFile::new(conn);
+        let file_size = file.size()?;
+        let (mut offset, end) = {
+            let offset = match self {
+                Self::ValidUpTo(offset) => *offset,
+                Self::Invalid => return None,
+            };
+            // The remaining number of bytes that we can check for all database
+            // files during the lifetime of the process, to reduce the overhead
+            // of opening each database. Chrome has a 20 MB limit; so do we.
+            static CHECKED_MMAP_PROCESS_LIFETIME_QUOTA: Mutex<u64> = Mutex::new(20 * 1024 * 1024);
+            let mut quota = CHECKED_MMAP_PROCESS_LIFETIME_QUOTA.lock().unwrap();
+            // Calculate how many more bytes we can check, before we either
+            // (1) reach the end of this database file, or (2) exhaust our
+            // lifetime quota. If the current offset is larger than the file,
+            // the file must have been truncated, so the offset is no longer
+            // valid, and we should check the file from the beginning.
+            let (offset, amount) = match file_size.checked_sub(offset) {
+                Some(amount) => (offset, amount.min(*quota)),
+                None => (0, file_size.min(*quota)),
+            };
+            *quota -= amount;
+            (offset, offset + amount)
+        };
+        while offset < end {
+            // The default page size is 4 KB. No need to query the actual size:
+            // if it's larger than the default, we'll do a few extra reads;
+            // if it's smaller, only the last read will be short.
+            let mut buf = [0u8; 4096];
+            match file.read_exact_at(&mut buf, offset) {
+                Ok(()) => {
+                    offset += buf.len() as u64;
+                    continue;
+                }
+                Err(err) => {
+                    return err.sqlite_error().and_then(|err| match err.code {
+                        rusqlite::ffi::ErrorCode::ApiMisuse => {
+                            // In-memory databases don't support file methods.
+                            None
+                        },
+                        rusqlite::ffi::ErrorCode::SystemIoFailure
+                            if err.extended_code == rusqlite::ffi::SQLITE_IOERR_SHORT_READ =>
+                        {
+                            // If the page size is smaller than 4 KB,
+                            // the last read will be short.
+                            Some(CheckedMmapSize::ValidUpTo(file_size))
+                        }
+                        _ => {
+                            // Any other file error means the database file
+                            // might be corrupt, and trying to use
+                            // memory-mapped I/O might cause a `SIGBUS`.
+                            Some(CheckedMmapSize::Invalid)
+                        }
+                    });
+                }
+            };
+        }
+        Some(CheckedMmapSize::ValidUpTo(offset))
+    }
+}
+
+impl FromSql for CheckedMmapSize {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let Ok(raw) = value.as_i64() else {
+            return Ok(Self::Invalid);
+        };
+        Ok(match u64::try_from(raw) {
+            Ok(size) => Self::ValidUpTo(size),
+            Err(_) => Self::Invalid,
+        })
+    }
+}
+
+impl ToSql for CheckedMmapSize {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(match self {
+            Self::ValidUpTo(s) => i64::try_from(*s).unwrap_or(-1),
+            Self::Invalid => -1,
+        }))
+    }
+}
+
+fn set_mmap_size(conn: &mut rusqlite::Connection) {
+    let dao = Dao::new(conn);
+    let new_offset = match dao.get_meta::<CheckedMmapSize>(MMAP_SIZE_META_KEY) {
+        Ok(old_mmap_size) => old_mmap_size
+            // If we've never mapped this database before,
+            // it won't have an `old_mmap_size`.
+            .unwrap_or_default()
+            .advance(conn)
+            .and_then(|new_mmap_size| {
+                let _ = dao.put_meta(MMAP_SIZE_META_KEY, new_mmap_size);
+                match new_mmap_size {
+                    CheckedMmapSize::ValidUpTo(offset) => Some(offset),
+                    CheckedMmapSize::Invalid => None,
+                }
+            }),
+        Err(_) => {
+            // ...But if we fail to get the `old_mmap_size`,
+            // don't try to map the database.
+            None
+        },
+    };
+    let _ = match new_offset {
+        Some(size) => conn.execute_batch(&format!("PRAGMA mmap_size = {size};")),
+        None => conn.execute_batch("PRAGMA mmap_size = 0;"),
+    };
+}
+
 impl Connection {
     /// Opens a connection to an SQLite database at the given path.
     pub fn new<M>(path: &impl ConnectionPath, type_: ConnectionType) -> Result<Self, M::Error>
@@ -75,13 +206,13 @@ impl Connection {
         )?;
 
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA page_size = 2048; -- For testing short reads.
+             PRAGMA journal_mode = WAL;
              PRAGMA journal_size_limit = 524288; -- 512 KB.
              PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA secure_delete = ON;
-             PRAGMA auto_vacuum = INCREMENTAL;
-            ",
+             PRAGMA auto_vacuum = INCREMENTAL;",
         )?;
 
         // Set hardening flags.
@@ -92,6 +223,17 @@ impl Connection {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, true)?;
 
+        // We use the `meta` table to store lower-level settings; so we
+        // create it here instead of in the higher-level schema.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta(
+               key TEXT PRIMARY KEY,
+               value NOT NULL
+             ) WITHOUT ROWID",
+        )?;
+
+        set_mmap_size(&mut conn);
+
         crate::functions::register(&mut conn)?;
 
         match type_ {
@@ -100,15 +242,16 @@ impl Connection {
                 // Read-write connections should upgrade the schema to
                 // the latest version.
                 let mut tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-                match tx.query_row_and_then("PRAGMA user_version", [], |row| row.get(0)) {
-                    Ok(mut version @ 1..) => {
+                match tx
+                    .query_row_and_then("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?
+                {
+                    mut version @ 1.. => {
                         while version < M::MAX_SCHEMA_VERSION {
                             M::upgrade(&mut tx, NonZeroU32::new(version + 1).unwrap())?;
                             version += 1;
                         }
                     }
-                    Ok(0) => M::create(&mut tx)?,
-                    Err(err) => Err(err)?,
+                    0 => M::create(&mut tx)?,
                 }
                 // Set the schema version to the highest that we support.
                 // If the current version is higher than ours, downgrade it,
@@ -299,5 +442,38 @@ impl ToConnectionIncident for rusqlite::Error {
             }
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::store::StorePath;
+
+    struct Migrator;
+
+    impl ConnectionMigrator for Migrator {
+        const MAX_SCHEMA_VERSION: u32 = 1;
+
+        type Error = rusqlite::Error;
+
+        fn create(_tx: &mut Transaction<'_>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn upgrade(_tx: &mut Transaction<'_>, _to_version: NonZeroU32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn open() {
+        let temp_dir = tempfile::TempDir::new().expect("should create temporary directory");
+        let path = StorePath::OnDisk(temp_dir.path().join("test.sqlite"));
+        let conn = Connection::new::<Migrator>(&path, ConnectionType::ReadWrite)
+            .expect("should open connection");
+
+        conn.close();
     }
 }

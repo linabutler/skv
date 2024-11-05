@@ -40,11 +40,6 @@ impl ConnectionMigrator for Schema {
                value BLOB NOT NULL, -- Encoded in JSONB format.
                PRIMARY KEY(db_id, key)
              ) WITHOUT ROWID;
-
-             CREATE TABLE meta(
-               key TEXT PRIMARY KEY,
-               value NOT NULL
-             ) WITHOUT ROWID;
             ",
         )?;
         Ok(())
